@@ -408,8 +408,11 @@ void taskLeitura(void *parameter) {
     Serial.printf("%.4f;%.2f;%.2f;%.2f;%.2f\n", tempo_s, angle, velPend, pos, velMot);
 
     // 5) Atualizar LED de status
-    digitalWrite(LED_STATUS, controleAtivo ? HIGH : LOW);
-  }
+    if (controleAtivo)
+      digitalWrite(LED_STATUS, HIGH);
+    else
+      digitalWrite(LED_STATUS, LOW);
+ }
 }
 
 // ==============================
