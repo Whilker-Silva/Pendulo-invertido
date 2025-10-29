@@ -87,6 +87,49 @@ Debounce db_dir = {HIGH, HIGH, 0, 50};
 Debounce db_on  = {HIGH, HIGH, 0, 50};
 Debounce db_off = {HIGH, HIGH, 0, 50};
 
+// HELPERS: Leitura ADC com escolha de bits e mapeamento p/ resistência e posição
+// ==============================
+// Estrutura de retorno para leitura do potenciômetro
+struct PotReading {
+  int raw;          // valor bruto do ADC (0..maxADC)
+  float ohms;       // resistência calculada (0..POT_MAX_OHMS)
+  float pos_cm;     // posição mapeada (0..GUIA_LENGTH_CM)
+};
+
+// Retorna o valor máximo do ADC dependendo de ADC_BITS
+int getMaxAdcValue() {
+  if (ADC_BITS == 11) return 2047;
+  return 4095; // default 12 bits
+}
+
+// Leitura do potenciômetro:
+// - analogRead() retorna 0..4095 (ESP32 padrão). 
+// - a leitura é linear, foi mapeado proporcionalmente para resistência (0..10000 ohms).
+// - em seguida foi mapeada resistância p/ posição em centímetros (0..70 cm).
+PotReading leituraPotentiometro() {
+  PotReading r;
+  int rawFull = analogRead(POT_PIN); // 0..4095 (ESP32 ADC padrão)
+  int maxADC = getMaxAdcValue();
+
+  // Se o usuário pediu 11 bits, reduzimos proporcionalmente
+  if (ADC_BITS == 11) {
+    // converte 0..4095 -> 0..2047 mantendo proporcionalidade
+    r.raw = (rawFull * maxADC) / 4095;
+  } else {
+    r.raw = rawFull;
+  }
+
+  // Mapeamento raw -> ohms (assumindo potenciômetro 0..POT_MAX_OHMS)
+  // Como a leitura ADC é proporcional à tensão, e a tensão é proporcional à divisão do potenciômetro,
+  // foi determinada leitura linear e foi mapeado diretamente. 
+  r.ohms = ((float)r.raw / (float)maxADC) * POT_MAX_OHMS;
+
+  // Mapear ohms -> posição ao longo do guia
+  r.pos_cm = (r.ohms / POT_MAX_OHMS) * GUIA_LENGTH_CM;
+
+  return r;
+}
+
 // ==============================
 // INTERRUPÇÕES DOS ENCODERS
 // ==============================
