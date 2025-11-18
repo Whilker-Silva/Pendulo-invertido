@@ -1,10 +1,12 @@
 // ==============================
 // CONFIGURAÇÃO DOS PINOS
 // ==============================
-#define ENCODER_PEND_A 32
-#define ENCODER_PEND_B 33
+#define ENCODER_PEND_A 33
+#define ENCODER_PEND_B 32
 #define ENCODER_MOT_A 13
 #define ENCODER_MOT_B 14
+
+#define POTENCIOMETRO 34
 
 #define MOTOR_PWM1 27
 #define MOTOR_PWM2 26
@@ -26,7 +28,7 @@ const int PULSOS_POR_REV_MOT  = 16;
 const int RESOLUCAO_PEND = PULSOS_POR_REV_PEND * 4;  // Quadratura 4x
 const int RESOLUCAO_MOT  = PULSOS_POR_REV_MOT  * 4;  // Quadratura 4x
 
-const float FATOR_CONV_DIST = 146.233;
+const float FATOR_CONV_DIST = 145.366; //Pulsos pos cm
 
 // Variáveis do degrau
 volatile bool degrauAtivo = false;
@@ -48,12 +50,36 @@ volatile uint8_t pwmManual = 180;
 // Variáveis do controlador
 volatile bool controleAtivo = false;
 float K[4] = {0, 0, 0, 0};
+float K_swing = 45;
+bool modoLQR = false;   // false = swing-up, true = LQR
+
+// Limiares de troca
+const float THETA_SWITCH = 20 * PI/180.0;       
+const float THETA_DOT_SWITCH = 120 * PI/180.0;  
+
+// Energia desejada do pêndulo ereto
+const float m = 0.0205;       // use os seus valores!
+const float l = 0.18;
+const float g = 9.81;
+const float I = 0.000207;
+const float M = 0.3088;       // massa do carrinho (kg)
+const float b = 0.000008;       // atrito do pêndulo
+const float c = 6.0;       // atrito do carrinho
+const float kt = 0.175;
+const float kb = 0.04;
+const float Rm = 10.5;
+const float r  = 0.071;
 
 // Estados;
-float pos = 0;
-float velMot = 0;
-float angle = 0;
-float velPend = 0;
+float x = 0;
+float x_dot = 0;
+float theta = 0;
+float theta_dot = 0;
+
+float velPendFilt = 0, velMotFilt = 0;
+
+float setpointPos = 0.0;
+
 
 // ==============================
 // INTERRUPÇÕES DOS ENCODERS
@@ -165,25 +191,73 @@ void aplicaSenoide() {
   }
 }
 
+// ==============================
+// CONTROLADOR POR SWING UP
+// ==============================
+
+float sign(float x_cop) {
+    if (x_cop > 0) return 1.0;
+    else if (x_cop < 0) return -1.0;
+    else return 0.0;
+}
+
+float Force2Volt(float F) {
+    float volt = (F * Rm * r * r + kt * kb * x_dot) / (kt * r);
+    return volt;
+}
+
+float swingUpController() {
+    float E = m*g*l*(1 - cos(theta)) + 0.5*(I + m*l*l)*(theta_dot*theta_dot);
+    float E_des = 2*m*g*l;  // topo
+
+    float arg = theta_dot * cos(theta);
+
+    float k_energy = K_swing * g;
+
+    float x_2dot_desejado = k_energy * (E - E_des) * sign(arg) - 2*x;
+    
+    float theta_2dot = (-b * theta_dot
+                        - m * l * cos(theta) * x_2dot_desejado
+                        - m * g * l * sin(theta))
+                       / (I + m * l * l);
+
+    // === Cálculo da força F no carrinho ===
+    float F = (M + m) * x_2dot_desejado
+                + m * l * cos(theta) * theta_2dot
+                - m * l * sin(theta) * (theta_dot * theta_dot)
+                + c * x_dot;
+
+    return Force2Volt(F);
+}
+
 
 // ==============================
 // FUNÇÃO PARA CONTROLE LQR
 // ==============================
 void controleEstado() {
-  // Estados: x = [angulo; velocidadeAngular; posição; velocidadeCarrinho]
-  // Entrada de controle: u = -K * x
-  float u = -(K[0]*angle + K[1]*velPend + K[2]*pos + K[3]*velMot);
 
-  // Saturação de PWM
-  u = constrain(u, -255, 255);
+  float erroX = x - (setpointPos / 100.0f);  // converte cm → metros, se sua pos está em m
+  float erroTheta = theta - PI; 
 
+  float u = 0;
+
+  if ((abs(erroTheta) < THETA_SWITCH) && (abs(theta_dot) < THETA_DOT_SWITCH)){
+    u = -(K[0]*erroX + K[1]*erroTheta + K[2]*x_dot + K[3]*theta_dot);
+  }else{
+    u = swingUpController();
+  }
+
+  float umax = 12.0;
+  u = constrain(u, -umax, umax);
+  float u_pwm = (u / umax) * 255.0;
+  
   // Aplica o controle ao motor
-  if (u >= 0) {
-    ledcWrite(0, (int)u);
+  if (u_pwm >= 0) {
+    ledcWrite(0, (int)u_pwm);
     ledcWrite(1, 0);
   } else {
     ledcWrite(0, 0);
-    ledcWrite(1, (int)(-u));
+    ledcWrite(1, (int)(-u_pwm));
   }
 }
 
@@ -195,12 +269,11 @@ void taskLeitura(void *parameter) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
 
   // Variáveis auxiliares para cálculo de velocidade
-  float angleAnt = 0;
-  float posAnt  = 0;
+  float theta_ant = 0;
+  float pos_ant  = 0;
 
   while (true) {
     vTaskDelayUntil(&xLastWakeTime, periodo);
-
 
     if(controleAtivo){
       controleEstado();
@@ -218,18 +291,38 @@ void taskLeitura(void *parameter) {
     long countMot = encoderMotCount;
     long countPend = encoderPendCount;
 
-    pos  = countMot/FATOR_CONV_DIST;
-    velMot  = (pos  - posAnt)*1000.0/PERIODO;
-    posAnt  = pos;
+    x = (float)countMot / (FATOR_CONV_DIST * 100.0f);
+    x_dot = (x - pos_ant) / (PERIODO / 1000.0);
+    pos_ant  = x;
 
+    // theta = ((countPend % RESOLUCAO_PEND) * 2*PI) / RESOLUCAO_PEND;
+    // if (theta >  PI) theta -= 2*PI;
+    // if (theta < -PI) theta += 2*PI;
 
-    angle = (((countPend % RESOLUCAO_PEND) * 360.0) / RESOLUCAO_PEND) + 180;
-    if (angle > 180.0) angle -= 360.0; //Mantêm ele dentro de -180 a 180
+    // theta_dot = (theta - theta_ant) / (PERIODO / 1000.0);
+    // theta_ant = theta;
 
-    velPend = (angle - angleAnt)*1000.0/PERIODO;
-    angleAnt = angle;
+    // Ângulo entre 0 e 2π
+    long idx = countPend % RESOLUCAO_PEND;
+    if (idx < 0) idx += RESOLUCAO_PEND;  // garante faixa positiva
 
-    Serial.printf("%.4f;%.2f;%.2f;%.2f;%.2f\n", tempo_s, angle, velPend, pos, velMot);
+    theta = (idx * 2*PI) / RESOLUCAO_PEND;  // 0 a 2π
+
+    // Cálculo correto da velocidade angular (trata salto 2π → 0)
+    float theta_raw = theta - theta_ant;
+
+    // Se houve passagem pelo zero:
+    if (theta_raw > PI)       theta_raw -= 2*PI;
+    else if (theta_raw < -PI) theta_raw += 2*PI;
+
+    theta_dot = theta_raw / (PERIODO / 1000.0);
+
+    theta_ant = theta;
+
+    int leituraPot = analogRead(POTENCIOMETRO);
+    setpointPos = ((float)leituraPot / 4095.0f) * 60.0f - 30.0f;
+
+    //Serial.printf("%.4f;%.2f;%.2f;%.2f;%.2f\n", tempo_s, theta*180/PI, theta_dot, x, x_dot);
   }
 }
 
@@ -239,7 +332,6 @@ void taskLeitura(void *parameter) {
 // ===========================================
 void taskSerial(void *parameter) {
     String buffer = "";
-    Serial.println("TEste");
     while (true) {
         while (Serial.available()) {
             char c = Serial.read();
@@ -314,13 +406,15 @@ void taskSerial(void *parameter) {
                         int idx1 = buffer.indexOf(',');
                         int idx2 = buffer.indexOf(',', idx1 + 1);
                         int idx3 = buffer.indexOf(',', idx2 + 1);
-                        int idx4 = buffer.lastIndexOf(',');
+                        int idx4 = buffer.indexOf(',', idx3 + 1);
+                        int idx5 = buffer.lastIndexOf(',');
 
-                        if (idx1 > 0 && idx2 > idx1 && idx3 > idx2 && idx4 > idx3) {
+                        if (idx1 > 0 && idx2 > idx1 && idx3 > idx2 && idx4 > idx3 && idx5 > idx4) {
                             K[0] = buffer.substring(idx1 + 1, idx2).toFloat();
                             K[1] = buffer.substring(idx2 + 1, idx3).toFloat();
                             K[2] = buffer.substring(idx3 + 1, idx4).toFloat();
-                            K[3] = buffer.substring(idx4 + 1).toFloat();
+                            K[3] = buffer.substring(idx4 + 1, idx5).toFloat();
+                            K_swing = buffer.substring(idx5 + 1).toFloat();
 
                             controleAtivo = true;
                             degrauAtivo = false;
@@ -381,18 +475,20 @@ void setup() {
   pinMode(ENCODER_MOT_B, INPUT);
   pinMode(MOTOR_PWM1, OUTPUT);
   pinMode(MOTOR_PWM2, OUTPUT);
+  pinMode(POTENCIOMETRO, INPUT);
+
 
   // PWM MOTOR 1
-  ledcSetup(0, 1000, 8);        // canal 0, 1kHz, 8 bits
+  ledcSetup(0, 7500, 8);        // canal 0, 1kHz, 8 bits
   ledcAttachPin(MOTOR_PWM1, 0);
 
   // PWM MOTOR 2
-  ledcSetup(1, 1000, 8);        // canal 1, 1kHz, 8 bits
+  ledcSetup(1, 7500, 8);        // canal 1, 1kHz, 8 bits
   ledcAttachPin(MOTOR_PWM2, 1);
 
   // Leitura inicial
-  lastEncodedPend = (digitalRead(ENCODER_PEND_A) << 1) | digitalRead(ENCODER_PEND_B);
-  lastEncodedMot  = (digitalRead(ENCODER_MOT_A)  << 1) | digitalRead(ENCODER_MOT_B);
+  //lastEncodedPend = (digitalRead(ENCODER_PEND_A) << 1) | digitalRead(ENCODER_PEND_B);
+  //lastEncodedMot  = (digitalRead(ENCODER_MOT_A)  << 1) | digitalRead(ENCODER_MOT_B);
 
   // Interrupções
   attachInterrupt(digitalPinToInterrupt(ENCODER_PEND_A), updateEncoderPend, CHANGE);
