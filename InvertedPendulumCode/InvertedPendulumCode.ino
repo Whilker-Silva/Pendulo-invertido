@@ -1,3 +1,7 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
 // ==============================
 // CONFIGURAÇÃO DOS PINOS
 // ==============================
@@ -10,6 +14,12 @@
 
 #define MOTOR_PWM1 27
 #define MOTOR_PWM2 26
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // ==============================
 // VARIÁVEIS GLOBAIS
@@ -54,8 +64,9 @@ float K_swing = 45;
 bool modoLQR = false;   // false = swing-up, true = LQR
 
 // Limiares de troca
-const float THETA_SWITCH = 20 * PI/180.0;       
-const float THETA_DOT_SWITCH = 120 * PI/180.0;  
+const float THETA_SWITCH = 12 * PI/180.0;       
+const float THETA_DOT_SWITCH = 15 * PI/180.0;  
+const float FIM_CURSO_VIRTUAL =  0.20; 
 
 // Energia desejada do pêndulo ereto
 const float m = 0.0205;       // use os seus valores!
@@ -214,7 +225,7 @@ float swingUpController() {
 
     float k_energy = K_swing * g;
 
-    float x_2dot_desejado = k_energy * (E - E_des) * sign(arg) - 2*x;
+    float x_2dot_desejado = k_energy * (E - E_des) * sign(arg) - 8*x;
     
     float theta_2dot = (-b * theta_dot
                         - m * l * cos(theta) * x_2dot_desejado
@@ -241,7 +252,12 @@ void controleEstado() {
 
   float u = 0;
 
-  if ((abs(erroTheta) < THETA_SWITCH) && (abs(theta_dot) < THETA_DOT_SWITCH)){
+  bool emZonaPerigo = abs(x) > FIM_CURSO_VIRTUAL;
+  bool emRegiaoLQR = (abs(erroTheta) < THETA_SWITCH) && (abs(theta_dot) < THETA_DOT_SWITCH);
+
+  if (emZonaPerigo){
+    u = - K[3] * erroX;
+  }else if(emRegiaoLQR){
     u = -(K[0]*erroX + K[1]*erroTheta + K[2]*x_dot + K[3]*theta_dot);
   }else{
     u = swingUpController();
@@ -295,13 +311,6 @@ void taskLeitura(void *parameter) {
     x_dot = (x - pos_ant) / (PERIODO / 1000.0);
     pos_ant  = x;
 
-    // theta = ((countPend % RESOLUCAO_PEND) * 2*PI) / RESOLUCAO_PEND;
-    // if (theta >  PI) theta -= 2*PI;
-    // if (theta < -PI) theta += 2*PI;
-
-    // theta_dot = (theta - theta_ant) / (PERIODO / 1000.0);
-    // theta_ant = theta;
-
     // Ângulo entre 0 e 2π
     long idx = countPend % RESOLUCAO_PEND;
     if (idx < 0) idx += RESOLUCAO_PEND;  // garante faixa positiva
@@ -315,15 +324,31 @@ void taskLeitura(void *parameter) {
     if (theta_raw > PI)       theta_raw -= 2*PI;
     else if (theta_raw < -PI) theta_raw += 2*PI;
 
-    theta_dot = theta_raw / (PERIODO / 1000.0);
+    theta_dot = theta_raw / (PERIODO / 1000.0) ;
 
     theta_ant = theta;
 
     int leituraPot = analogRead(POTENCIOMETRO);
-    setpointPos = ((float)leituraPot / 4095.0f) * 60.0f - 30.0f;
+    setpointPos = ((float)leituraPot / 4095.0f) * 30.0f - 15.0f;
 
-    //Serial.printf("%.4f;%.2f;%.2f;%.2f;%.2f\n", tempo_s, theta*180/PI, theta_dot, x, x_dot);
+    //Serial.printf("%.4f;%.2f;%.2f;%.2f;%.2f\n", tempo_s, theta*180/PI, theta_dot, x*100, x_dot*100);
   }
+}
+
+// ======================================================================
+// TAREFA DE ATUALIZAÇÃO DO DISPLAY OLED (LENTA)
+// ======================================================================
+void taskDisplay(void *parameter) {
+    // Define um período mais longo para o display, por exemplo, 100ms (10Hz)
+    const TickType_t displayPeriodo = pdMS_TO_TICKS(100); 
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    while (true) {
+        vTaskDelayUntil(&xLastWakeTime, displayPeriodo);
+
+        // Apenas chama a função de desenho e envio (display.display())
+        atualizarDisplay();
+    }
 }
 
 // ==============================
@@ -419,6 +444,10 @@ void taskSerial(void *parameter) {
                             controleAtivo = true;
                             degrauAtivo = false;
                             senoideAtiva = false;
+
+                            if(theta == 0){
+                              ledcWrite(1, 200);
+                            }
                         }
                     }
 
@@ -463,11 +492,102 @@ void taskSerial(void *parameter) {
     }
 }
 
+// ======================================================================
+//  DISPLAY OLED
+// ======================================================================
+void telaBoasVindas() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(20, 8);
+  display.println("Projeto");
+
+  display.setCursor(10, 22);
+  display.println("Lab Integrador");
+
+  display.setCursor(0, 48);
+  display.println("Inicializando...");
+
+  display.display();
+  delay(2500);
+}
+
+void telaCalibrandoPendulo() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 8);
+  display.println("Calibrando pendulo...");
+  display.setCursor(0, 28);
+  display.println("Deixe em repouso");
+
+  display.display();
+}
+
+void atualizarDisplay() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // ----- Titulo centralizado -----
+  display.setTextSize(1);
+  const char titulo[] = "Projeto LabIntegrador";
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(titulo, 0, 0, &x1, &y1, &w, &h);
+  int16_t xTitulo = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(xTitulo, 0);
+  display.print(titulo);
+
+  // Linha separadora
+  display.drawLine(0, 10, SCREEN_WIDTH - 1, 10, SSD1306_WHITE);
+
+  // ----- Bloco MOTOR -----
+  display.setTextSize(1);
+  display.setCursor(0, 14);
+  display.print("Posição");
+
+  display.setTextSize(2);
+  display.setCursor(50, 24);
+  display.print(x*100, 1);
+
+  display.setTextSize(1);
+  display.setCursor(0, 30);
+  display.print("cm");
+
+  display.drawLine(0, 42, SCREEN_WIDTH - 1, 42, SSD1306_WHITE);
+
+  // ----- Bloco PENDULO -----
+  display.setTextSize(1);
+  display.setCursor(0, 46);
+  display.print("Set Point");
+
+  display.setTextSize(2);
+  display.setCursor(50, 52 - 8);
+  display.print(setpointPos, 1);
+
+  display.setTextSize(1);
+  display.setCursor(0, 62 - 4);
+  display.print("deg");
+
+  display.display();
+}
+
 // ==============================
 // CONFIGURAÇÃO INICIAL
 // ==============================
 void setup() {
   Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("Falha ao iniciar display!");
+    while (true) {}
+  }
+
+  telaBoasVindas();
+
 
   pinMode(ENCODER_PEND_A, INPUT);
   pinMode(ENCODER_PEND_B, INPUT);
@@ -479,11 +599,11 @@ void setup() {
 
 
   // PWM MOTOR 1
-  ledcSetup(0, 7500, 8);        // canal 0, 1kHz, 8 bits
+  ledcSetup(0, 10000, 8);        // canal 0, 10kHz, 8 bits
   ledcAttachPin(MOTOR_PWM1, 0);
 
   // PWM MOTOR 2
-  ledcSetup(1, 7500, 8);        // canal 1, 1kHz, 8 bits
+  ledcSetup(1, 10000, 8);        // canal 1, 10kHz, 8 bits
   ledcAttachPin(MOTOR_PWM2, 1);
 
   // Leitura inicial
@@ -499,6 +619,7 @@ void setup() {
   // Cria tarefa FreeRTOS
   xTaskCreatePinnedToCore(taskLeitura, "TaskLeitura", 4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(taskSerial,   "TaskSerial",  2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskDisplay, "TaskDisplay", 4096, NULL, 1, NULL, 0);
 
 }
 
